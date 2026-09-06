@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: eventdb
+      POSTGRES_USER: event
+      POSTGRES_PASSWORD: event
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U event -d eventdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server","--appendonly","yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD","redis-cli","ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app1:
+    build: .
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://event:event@postgres:5432/eventdb
+      REDIS_URL: redis://redis:6379
+      INSTANCE_NAME: app1
+      JWT_SECRET: local-change-me
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  app2:
+    build: .
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://event:event@postgres:5432/eventdb
+      REDIS_URL: redis://redis:6379
+      INSTANCE_NAME: app2
+      JWT_SECRET: local-change-me
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  app3:
+    build: .
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://event:event@postgres:5432/eventdb
+      REDIS_URL: redis://redis:6379
+      INSTANCE_NAME: app3
+      JWT_SECRET: local-change-me
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  worker:
+    build: .
+    command: ["npm","run","worker"]
+    environment:
+      DATABASE_URL: postgres://event:event@postgres:5432/eventdb
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: local-change-me
+      INSTANCE_NAME: worker
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./public:/usr/share/nginx/html:ro
+    depends_on:
+      - app1
+      - app2
+      - app3
+
+volumes:
+  pgdata:
+  redisdata:
