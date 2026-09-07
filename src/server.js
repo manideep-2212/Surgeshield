@@ -38,6 +38,7 @@ app.use((req,res,next)=>{
 async function runMigrations(){
   try{
     await pool.query(`ALTER TABLE registrations ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 1;`);
+    await pool.query(`ALTER TABLE registrations ADD COLUMN IF NOT EXISTS seat_numbers TEXT;`);
     await pool.query(`
       DO $$
       BEGIN
@@ -47,6 +48,22 @@ async function runMigrations(){
       END $$;
     `);
     await pool.query(`ALTER TABLE registrations DROP CONSTRAINT IF EXISTS registrations_event_id_user_id_key;`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS seat_reservations (
+        id BIGSERIAL PRIMARY KEY,
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        seat_number TEXT NOT NULL,
+        user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+        hold_token TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'HELD' CHECK (status IN ('HELD', 'BOOKED')),
+        held_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        registration_id BIGINT REFERENCES registrations(id) ON DELETE CASCADE,
+        UNIQUE(event_id, seat_number)
+      );
+      CREATE INDEX IF NOT EXISTS idx_seat_res_event ON seat_reservations(event_id);
+      CREATE INDEX IF NOT EXISTS idx_seat_res_status ON seat_reservations(status, expires_at);
+    `);
     await pool.query(`
       INSERT INTO events(name,venue,starts_at,total_seats,available_seats)
       SELECT 'Concurrency Stress Test [5 Seats]','Demo Sandbox',now()+interval '7 days',5,5
@@ -77,6 +94,32 @@ function auth(req,res,next){
   const h=req.get("authorization")||"";
   if(!h.startsWith("Bearer "))return res.status(401).json({message:"Authentication required",servedBy:INSTANCE});
   try{req.user=jwt.verify(h.slice(7),SECRET);next();}catch{return res.status(401).json({message:"Invalid or expired token",servedBy:INSTANCE});}
+}
+function optionalAuth(req,res,next){
+  const h=req.get("authorization")||"";
+  if(h.startsWith("Bearer ")){
+    try{req.user=jwt.verify(h.slice(7),SECRET);}catch{req.user=null;}
+  }else{
+    req.user=null;
+  }
+  next();
+}
+function getSeatListForEvent(totalSeats){
+  const seats=[];
+  if(totalSeats<=10){
+    for(let i=1;i<=totalSeats;i++) seats.push(`S${i}`);
+    return seats;
+  }
+  const rows="ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let seatIdx=0;
+  for(let r=0;r<rows.length&&seatIdx<totalSeats;r++){
+    const rowLetter=rows[r];
+    for(let num=1;num<=10&&seatIdx<totalSeats;num++){
+      seats.push(`${rowLetter}${num}`);
+      seatIdx++;
+    }
+  }
+  return seats;
 }
 function organizer(req,res,next){if(req.user.role!=="ORGANIZER")return res.status(403).json({message:"Organizer access required",servedBy:INSTANCE});next();}
 async function clearEventsCache(){await redis.del("events:list");}
@@ -146,6 +189,300 @@ app.get("/api/events/:id",async(req,res,next)=>{
  }catch(e){next(e);}
 });
 
+// Seat Map layout and status
+app.get("/api/events/:id/seats",optionalAuth,async(req,res,next)=>{
+  try{
+    const eventId=Number(req.params.id);
+    const holdToken=String(req.query.holdToken||"");
+    const currentUserId=req.user?Number(req.user.id):null;
+
+    // Purge expired holds
+    await pool.query("DELETE FROM seat_reservations WHERE status='HELD' AND expires_at <= now()");
+
+    const eventRes=await pool.query("SELECT id,name,total_seats,available_seats FROM events WHERE id=$1",[eventId]);
+    if(!eventRes.rows[0])return res.status(404).json({message:"Event not found",servedBy:INSTANCE});
+    const event=eventRes.rows[0];
+
+    const reservationsRes=await pool.query(
+      `SELECT seat_number, status, user_id, hold_token, expires_at,
+              CASE WHEN status = 'HELD' THEN GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now()))::bigint) ELSE 0 END AS remaining_seconds
+       FROM seat_reservations
+       WHERE event_id = $1`,
+      [eventId]
+    );
+
+    const resMap=new Map();
+    for(const r of reservationsRes.rows){
+      resMap.set(r.seat_number,r);
+    }
+
+    const allSeats=getSeatListForEvent(event.total_seats);
+    const seats=allSeats.map(sn=>{
+      const resData=resMap.get(sn);
+      if(!resData){
+        return {seatNumber:sn,status:"AVAILABLE"};
+      }
+      if(resData.status==="BOOKED"){
+        return {seatNumber:sn,status:"BOOKED"};
+      }
+      const isMyHold=(currentUserId&&Number(resData.user_id)===currentUserId)||(holdToken&&resData.hold_token===holdToken);
+      return {
+        seatNumber:sn,
+        status:isMyHold?"HELD_BY_ME":"HELD_BY_OTHER",
+        remainingSeconds:Number(resData.remaining_seconds)||0,
+        expiresAt:resData.expires_at,
+        holdToken:isMyHold?resData.hold_token:undefined
+      };
+    });
+
+    res.json({
+      eventId:event.id,
+      eventName:event.name,
+      totalSeats:event.total_seats,
+      availableSeats:event.available_seats,
+      holdDurationSeconds:120,
+      seats,
+      servedBy:INSTANCE
+    });
+  }catch(e){next(e);}
+});
+
+// Hold seat for 2 minutes (Pessimistic Concurrency Protected)
+app.post("/api/events/:id/seats/hold",auth,async(req,res,next)=>{
+  const eventId=Number(req.params.id),userId=Number(req.user.id);
+  const seatNumber=String(req.body.seatNumber||"").trim().toUpperCase();
+  if(!seatNumber)return res.status(400).json({message:"seatNumber is required",servedBy:INSTANCE});
+
+  const db=await pool.connect();
+  try{
+    await db.query("BEGIN");
+    await db.query("DELETE FROM seat_reservations WHERE status='HELD' AND expires_at <= now()");
+
+    const eventRes=await db.query("SELECT id,name,available_seats,total_seats FROM events WHERE id=$1 FOR UPDATE",[eventId]);
+    if(!eventRes.rows[0]){
+      await db.query("ROLLBACK");
+      return res.status(404).json({message:"Event not found",servedBy:INSTANCE});
+    }
+
+    const validSeats=getSeatListForEvent(eventRes.rows[0].total_seats);
+    if(!validSeats.includes(seatNumber)){
+      await db.query("ROLLBACK");
+      return res.status(400).json({message:`Invalid seat number ${seatNumber} for this event`,servedBy:INSTANCE});
+    }
+
+    const existing=await db.query(
+      "SELECT * FROM seat_reservations WHERE event_id=$1 AND seat_number=$2 FOR UPDATE",
+      [eventId,seatNumber]
+    );
+
+    if(existing.rows[0]){
+      const cur=existing.rows[0];
+      if(cur.status==="BOOKED"){
+        await db.query("ROLLBACK");
+        return res.status(409).json({message:`Seat ${seatNumber} is already booked`,seatNumber,servedBy:INSTANCE});
+      }
+      if(cur.status==="HELD"){
+        if(Number(cur.user_id)===userId){
+          const renewRes=await db.query(
+            `UPDATE seat_reservations 
+             SET expires_at = now() + interval '120 seconds'
+             WHERE id = $1
+             RETURNING id,seat_number,hold_token,expires_at,120 AS remaining_seconds`,
+            [cur.id]
+          );
+          await db.query("COMMIT");
+          return res.json({
+            message:`Seat ${seatNumber} hold refreshed for 2 minutes`,
+            holdToken:renewRes.rows[0].hold_token,
+            seatNumber,
+            expiresAt:renewRes.rows[0].expires_at,
+            remainingSeconds:120,
+            servedBy:INSTANCE
+          });
+        } else {
+          await db.query("ROLLBACK");
+          return res.status(409).json({
+            message:`Seat ${seatNumber} is currently held by another attendee. Concurrency lock prevented duplicate reservation.`,
+            seatNumber,
+            servedBy:INSTANCE
+          });
+        }
+      }
+    }
+
+    if(Number(eventRes.rows[0].available_seats)<=0){
+      await db.query("ROLLBACK");
+      return res.status(409).json({message:"Sold out",servedBy:INSTANCE});
+    }
+
+    // Release any previously held seats by this user for this event
+    await db.query("DELETE FROM seat_reservations WHERE event_id=$1 AND user_id=$2 AND status='HELD'",[eventId,userId]);
+
+    const holdToken=crypto.randomUUID();
+    const inserted=await db.query(
+      `INSERT INTO seat_reservations(event_id,seat_number,user_id,hold_token,status,held_at,expires_at)
+       VALUES($1,$2,$3,$4,'HELD',now(),now() + interval '120 seconds')
+       RETURNING id,seat_number,hold_token,expires_at,120 AS remaining_seconds`,
+      [eventId,seatNumber,userId,holdToken]
+    );
+
+    await db.query("COMMIT");
+    res.status(200).json({
+      message:`Seat ${seatNumber} held for 2 minutes`,
+      holdToken:inserted.rows[0].hold_token,
+      seatNumber:inserted.rows[0].seat_number,
+      expiresAt:inserted.rows[0].expires_at,
+      remainingSeconds:120,
+      servedBy:INSTANCE
+    });
+  }catch(e){
+    try{await db.query("ROLLBACK");}catch{}
+    if(e.code==="23505"){
+      return res.status(409).json({
+        message:`Concurrency conflict: Seat ${seatNumber} was just claimed by another user`,
+        seatNumber,
+        servedBy:INSTANCE
+      });
+    }
+    next(e);
+  }finally{
+    db.release();
+  }
+});
+
+// Confirm held seat
+app.post("/api/events/:id/seats/confirm",auth,async(req,res,next)=>{
+  const eventId=Number(req.params.id),userId=Number(req.user.id);
+  const seatNumber=String(req.body.seatNumber||"").trim().toUpperCase();
+  const holdToken=String(req.body.holdToken||"").trim();
+  const key=String(req.get("Idempotency-Key")||"").trim()||crypto.randomUUID();
+
+  if(!seatNumber)return res.status(400).json({message:"seatNumber is required",servedBy:INSTANCE});
+
+  const db=await pool.connect();
+  try{
+    await db.query("BEGIN");
+
+    // Idempotency check
+    const idem=await db.query(
+      "SELECT r.id,r.quantity,r.seat_numbers,r.status,r.created_at,e.name FROM registrations r JOIN events e ON e.id=r.event_id WHERE r.event_id=$1 AND r.idempotency_key=$2",
+      [eventId,key]
+    );
+    if(idem.rows[0]){
+      await db.query("COMMIT");
+      regCounter.inc({result:"idempotent-replay",instance:INSTANCE});
+      return res.json({message:"Already processed",registration:idem.rows[0],replayed:true,servedBy:INSTANCE});
+    }
+
+    await db.query("DELETE FROM seat_reservations WHERE status='HELD' AND expires_at <= now()");
+
+    const lockedEvent=await db.query("SELECT id,name,available_seats,total_seats FROM events WHERE id=$1 FOR UPDATE",[eventId]);
+    if(!lockedEvent.rows[0]){
+      await db.query("ROLLBACK");
+      return res.status(404).json({message:"Event not found",servedBy:INSTANCE});
+    }
+    if(Number(lockedEvent.rows[0].available_seats)<1){
+      await db.query("ROLLBACK");
+      return res.status(409).json({message:"Sold out",servedBy:INSTANCE});
+    }
+
+    const seatRes=await db.query(
+      "SELECT * FROM seat_reservations WHERE event_id=$1 AND seat_number=$2 FOR UPDATE",
+      [eventId,seatNumber]
+    );
+
+    if(!seatRes.rows[0]){
+      await db.query("ROLLBACK");
+      return res.status(409).json({
+        message:`Hold expired on seat ${seatNumber}. The 2-minute booking window elapsed. Please re-select the seat.`,
+        seatNumber,
+        servedBy:INSTANCE
+      });
+    }
+
+    const cur=seatRes.rows[0];
+    if(cur.status==="BOOKED"){
+      await db.query("ROLLBACK");
+      return res.status(409).json({message:`Seat ${seatNumber} is already booked`,seatNumber,servedBy:INSTANCE});
+    }
+
+    if(holdToken&&cur.hold_token!==holdToken){
+      await db.query("ROLLBACK");
+      return res.status(403).json({message:`Invalid hold token for seat ${seatNumber}`,servedBy:INSTANCE});
+    }
+    if(Number(cur.user_id)!==userId){
+      await db.query("ROLLBACK");
+      return res.status(403).json({message:`Seat ${seatNumber} is held by another user`,servedBy:INSTANCE});
+    }
+
+    await db.query("UPDATE events SET available_seats=available_seats-1 WHERE id=$1",[eventId]);
+
+    const insertedReg=await db.query(
+      `INSERT INTO registrations(event_id,user_id,idempotency_key,quantity,seat_numbers)
+       VALUES($1,$2,$3,1,$4)
+       RETURNING id,event_id,user_id,quantity,seat_numbers,status,created_at`,
+      [eventId,userId,key,seatNumber]
+    );
+
+    await db.query(
+      "UPDATE seat_reservations SET status='BOOKED',registration_id=$1 WHERE id=$2",
+      [insertedReg.rows[0].id,cur.id]
+    );
+
+    const outbox=await db.query("INSERT INTO notification_outbox(registration_id) VALUES($1) RETURNING id",[insertedReg.rows[0].id]);
+    await db.query("COMMIT");
+
+    await notificationQueue.add(
+      "registration-confirmation",
+      {registrationId:insertedReg.rows[0].id,outboxId:outbox.rows[0].id,userId,eventId,quantity:1,seatNumber},
+      {attempts:5,backoff:{type:"exponential",delay:1000},removeOnComplete:1000,removeOnFail:5000}
+    );
+
+    await clearEventsCache();
+    regCounter.inc({result:"confirmed",instance:INSTANCE});
+
+    res.status(201).json({
+      message:`Seat ${seatNumber} booked successfully!`,
+      registration:insertedReg.rows[0],
+      seatNumber,
+      notification:"queued",
+      remainingSeats:Number(lockedEvent.rows[0].available_seats)-1,
+      servedBy:INSTANCE
+    });
+  }catch(e){
+    try{await db.query("ROLLBACK");}catch{}
+    if(e.code==="23505"){
+      return res.status(409).json({message:"Duplicate registration request or seat already booked",servedBy:INSTANCE});
+    }
+    next(e);
+  }finally{
+    db.release();
+  }
+});
+
+// Explicit release of a held seat
+app.post("/api/events/:id/seats/release",optionalAuth,async(req,res,next)=>{
+  const eventId=Number(req.params.id);
+  const seatNumber=String(req.body.seatNumber||"").trim().toUpperCase();
+  const holdToken=String(req.body.holdToken||"").trim();
+  const userId=req.user?Number(req.user.id):null;
+
+  try{
+    if(holdToken){
+      await pool.query(
+        "DELETE FROM seat_reservations WHERE event_id=$1 AND seat_number=$2 AND status='HELD' AND hold_token=$3",
+        [eventId,seatNumber,holdToken]
+      );
+    }else if(userId){
+      await pool.query(
+        "DELETE FROM seat_reservations WHERE event_id=$1 AND seat_number=$2 AND status='HELD' AND user_id=$3",
+        [eventId,seatNumber,userId]
+      );
+    }
+    res.json({message:`Seat ${seatNumber} released`,seatNumber,servedBy:INSTANCE});
+  }catch(e){next(e);}
+});
+
 app.post("/api/events/:id/register",auth,async(req,res,next)=>{
  const eventId=Number(req.params.id),userId=Number(req.user.id);
  const key=String(req.get("Idempotency-Key")||"").trim();
@@ -161,7 +498,7 @@ app.post("/api/events/:id/register",auth,async(req,res,next)=>{
  try{
   await db.query("BEGIN");
   // 1. Idempotency protection check
-  const idem=await db.query(`SELECT r.id,r.quantity,r.status,r.created_at,e.name FROM registrations r JOIN events e ON e.id=r.event_id WHERE r.event_id=$1 AND r.idempotency_key=$2`,[eventId,key]);
+  const idem=await db.query(`SELECT r.id,r.quantity,r.seat_numbers,r.status,r.created_at,e.name FROM registrations r JOIN events e ON e.id=r.event_id WHERE r.event_id=$1 AND r.idempotency_key=$2`,[eventId,key]);
   if(idem.rows[0]){
     await db.query("COMMIT");
     regCounter.inc({result:"idempotent-replay",instance:INSTANCE});
@@ -186,19 +523,45 @@ app.post("/api/events/:id/register",auth,async(req,res,next)=>{
     });
   }
 
-  // 3. Atomically decrement seats & insert registration (allows legitimate repeated bookings)
+  // 3. Atomically decrement seats, auto-allocate seats & insert registration
   await db.query("UPDATE events SET available_seats=available_seats-$1 WHERE id=$2",[quantity,eventId]);
-  const inserted=await db.query(
-    `INSERT INTO registrations(event_id,user_id,idempotency_key,quantity) VALUES($1,$2,$3,$4) RETURNING id,event_id,user_id,quantity,status,created_at`,
-    [eventId,userId,key,quantity]
+
+  const allSeatNames=getSeatListForEvent(locked.rows[0].total_seats);
+  const occupiedRes=await db.query(
+    "SELECT seat_number FROM seat_reservations WHERE event_id=$1 AND (status='BOOKED' OR (status='HELD' AND expires_at > now()))",
+    [eventId]
   );
+  const occupiedSet=new Set(occupiedRes.rows.map(r=>r.seat_number));
+  const allocatedSeats=[];
+  for(const sn of allSeatNames){
+    if(!occupiedSet.has(sn)){
+      allocatedSeats.push(sn);
+      if(allocatedSeats.length===quantity) break;
+    }
+  }
+  const seatStr=allocatedSeats.join(", ");
+
+  const inserted=await db.query(
+    `INSERT INTO registrations(event_id,user_id,idempotency_key,quantity,seat_numbers) VALUES($1,$2,$3,$4,$5) RETURNING id,event_id,user_id,quantity,seat_numbers,status,created_at`,
+    [eventId,userId,key,quantity,seatStr]
+  );
+
+  for(const s of allocatedSeats){
+    await db.query(
+      `INSERT INTO seat_reservations(event_id,seat_number,user_id,hold_token,status,registration_id,expires_at)
+       VALUES($1,$2,$3,'AUTO','BOOKED',$4,now() + interval '365 days')
+       ON CONFLICT (event_id,seat_number) DO UPDATE SET status='BOOKED',registration_id=EXCLUDED.registration_id`,
+      [eventId,s,userId,inserted.rows[0].id]
+    );
+  }
+
   const outbox=await db.query("INSERT INTO notification_outbox(registration_id) VALUES($1) RETURNING id",[inserted.rows[0].id]);
   await db.query("COMMIT");
 
   // 4. Dispatch async confirmation job to BullMQ
   await notificationQueue.add(
     "registration-confirmation",
-    {registrationId:inserted.rows[0].id,outboxId:outbox.rows[0].id,userId,eventId,quantity},
+    {registrationId:inserted.rows[0].id,outboxId:outbox.rows[0].id,userId,eventId,quantity,seatNumbers:seatStr},
     {attempts:5,backoff:{type:"exponential",delay:1000},removeOnComplete:1000,removeOnFail:5000}
   );
   await clearEventsCache();
@@ -221,7 +584,7 @@ app.post("/api/events/:id/register",auth,async(req,res,next)=>{
 app.get("/api/my-registrations",auth,async(req,res,next)=>{
  try{
    const {rows}=await pool.query(`
-     SELECT r.id,r.quantity,r.status,r.created_at,e.id event_id,e.name,e.venue,e.starts_at,
+     SELECT r.id,r.quantity,r.seat_numbers,r.status,r.created_at,e.id event_id,e.name,e.venue,e.starts_at,
             COALESCE(no.status, 'QUEUED') AS notification_status,
             no.sent_at
      FROM registrations r
@@ -251,6 +614,8 @@ app.post("/api/demo/reset-concurrency-event",async(req,res,next)=>{
       WHERE name='Concurrency Stress Test [5 Seats]'
       RETURNING id,name,total_seats,available_seats
     `);
+    await pool.query("DELETE FROM seat_reservations WHERE event_id IN (SELECT id FROM events WHERE name='Concurrency Stress Test [5 Seats]')");
+    await pool.query("DELETE FROM registrations WHERE event_id IN (SELECT id FROM events WHERE name='Concurrency Stress Test [5 Seats]')");
     await clearEventsCache();
     res.json({message:"Concurrency test event reset to 5 seats",event:rows[0],servedBy:INSTANCE});
   }catch(e){next(e);}
@@ -265,6 +630,7 @@ app.post("/api/events/:id/reset-capacity",auth,organizer,async(req,res,next)=>{
       [eventId]
     );
     if(!rows[0]) return res.status(404).json({message:"Event not found",servedBy:INSTANCE});
+    await pool.query("DELETE FROM seat_reservations WHERE event_id=$1",[eventId]);
     await clearEventsCache();
     res.json({message:`Event "${rows[0].name}" reset to starting capacity (${rows[0].total_seats} seats)`,event:rows[0],servedBy:INSTANCE});
   }catch(e){next(e);}
@@ -276,6 +642,7 @@ app.post("/api/events/reset-all-capacity",auth,organizer,async(req,res,next)=>{
     const {rows}=await pool.query(
       `UPDATE events SET available_seats=total_seats RETURNING id,name,total_seats,available_seats`
     );
+    await pool.query("DELETE FROM seat_reservations");
     await clearEventsCache();
     res.json({message:"All events reset to starting capacity",events:rows,servedBy:INSTANCE});
   }catch(e){next(e);}
@@ -285,6 +652,7 @@ app.post("/api/events/reset-all-capacity",auth,organizer,async(req,res,next)=>{
 app.post("/api/admin/reset-system",auth,organizer,async(req,res,next)=>{
   try{
     await pool.query("TRUNCATE TABLE registrations CASCADE;");
+    await pool.query("TRUNCATE TABLE seat_reservations CASCADE;");
     await pool.query("TRUNCATE TABLE notification_outbox CASCADE;");
     await pool.query("UPDATE events SET available_seats = total_seats;");
     await redis.del("events:list");
@@ -380,5 +748,13 @@ app.use((err,req,res,next)=>{
   await pool.query("SELECT 1");
   await runMigrations();
   await seedDemoUsers();
+  
+  // Background sweeper to automatically release expired seat holds every 5 seconds
+  setInterval(async()=>{
+    try{
+      await pool.query("DELETE FROM seat_reservations WHERE status='HELD' AND expires_at <= now()");
+    }catch(e){}
+  }, 5000);
+
   app.listen(PORT,()=>console.log(`API ${INSTANCE} listening on ${PORT}`));
 })().catch(e=>{console.error(e);process.exit(1);});

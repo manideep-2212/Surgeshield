@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS registrations (
   event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   quantity INTEGER NOT NULL DEFAULT 1 CHECK(quantity > 0),
+  seat_numbers TEXT,
   idempotency_key TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'CONFIRMED',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -40,9 +41,24 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   sent_at TIMESTAMPTZ
 );
 
+CREATE TABLE IF NOT EXISTS seat_reservations (
+  id BIGSERIAL PRIMARY KEY,
+  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  seat_number TEXT NOT NULL,
+  user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+  hold_token TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'HELD' CHECK (status IN ('HELD', 'BOOKED')),
+  held_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  registration_id BIGINT REFERENCES registrations(id) ON DELETE CASCADE,
+  UNIQUE(event_id, seat_number)
+);
+
 CREATE INDEX IF NOT EXISTS idx_reg_event ON registrations(event_id);
 CREATE INDEX IF NOT EXISTS idx_reg_user ON registrations(user_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON notification_outbox(status);
+CREATE INDEX IF NOT EXISTS idx_seat_res_event ON seat_reservations(event_id);
+CREATE INDEX IF NOT EXISTS idx_seat_res_status ON seat_reservations(status, expires_at);
 
 INSERT INTO events(name,venue,starts_at,total_seats,available_seats)
 SELECT 'High Traffic Tech Conference','Main Auditorium',now()+interval '30 days',100,100
